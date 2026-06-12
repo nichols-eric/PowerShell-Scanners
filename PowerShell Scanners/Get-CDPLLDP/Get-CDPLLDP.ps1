@@ -5,8 +5,8 @@ cleaned neighbor/port strings.
 #>
 [CmdletBinding()]
 param (
-    [int]$MaxAttempts = 10,
-    [int]$CaptureSecondsPerAttempt = 30,
+    [int]$MaxAttempts = 10, #As a PDQ Connect scanner, it will time out after 2 min, change this to 2 but you might not capture the elusive packets in that time
+    [int]$CaptureSecondsPerAttempt = 30, #Alternatively run as an automated package or scheduled task
     [switch]$IncludeLLDP = $true,
     [switch]$ClearCache
 )
