@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
     Ultra-silent pktmon CDP/LLDP discovery with
-cleaned neighbor/port strings.
+    cleaned neighbor/port strings.
 #>
 [CmdletBinding()]
 param (
@@ -14,7 +14,7 @@ param (
 # Admin check
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     return [PSCustomObject]@{
-        Date               = Get-Date
+        Date               = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
         NeighborDeviceName = "ERROR: Administrator privileges required"
         NeighborDevicePort = "ERROR: Administrator privileges required"
         Protocol           = "N/A"
@@ -23,10 +23,22 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 
 $CacheFile = Join-Path $env:TEMP -ChildPath "CDP_LLDPCache.json"
 
-# Load cache - wrapped Test-Path in parentheses to prevent parameter errors
+# Load cache
 if ((Test-Path $CacheFile) -and -not $ClearCache) {
     try {
         $CachedRecords = Get-Content $CacheFile -Raw | ConvertFrom-Json
+        # Flatten incoming cached objects to ensure dates are plain strings
+        if ($CachedRecords) {
+            $CachedRecords = @($CachedRecords) | ForEach-Object {
+                $CleanDate = if ($_.Date -like '@{value=*') { (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") } else { [string]$_.Date }
+                [PSCustomObject]@{
+                    Date               = $CleanDate
+                    NeighborDeviceName = [string]$_.NeighborDeviceName
+                    NeighborDevicePort = [string]$_.NeighborDevicePort
+                    Protocol           = [string]$_.Protocol
+                }
+            }
+        }
     } catch { 
         $CachedRecords = @() 
     }
@@ -41,7 +53,7 @@ $EthernetUp = Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
 if (-not $EthernetUp) {
     if ($CachedRecords.Count -eq 0) {
         return [PSCustomObject]@{
-            Date               = Get-Date
+            Date               = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
             NeighborDeviceName = "No neighbor found"
             NeighborDevicePort = "No neighbor found"
             Protocol           = "N/A"
@@ -83,9 +95,26 @@ for ($Attempt = 1; $Attempt -le $MaxAttempts; $Attempt++) {
         $Content = Get-Content $TxtFile -Raw -ErrorAction SilentlyContinue
         if (-not $Content) { continue }
 
-        # Improved regex - much stricter cleanup
-        $DeviceRegex = [regex]::new('(?i)(?:Device-ID|Chassis ID|System Name)[\s:]+(.+?)(?:\s*(?:value length|bytes|TLV|\(|,|\r|$))', 'IgnoreCase')
-        $PortRegex   = [regex]::new('(?i)(?:Port-ID|Port ID)[\s:]+(.+?)(?:\s*(?:value length|bytes|TLV|Subtype|\(|,|\r|$))', 'IgnoreCase')
+<#
+        # =========================================================================
+        # DEBUG BLOCK: Output human-readable packet text windows containing data
+        # =========================================================================
+        $DebugSections = $Content -split '(?i)\[\d+\]\d{4}\.\d+::'
+        foreach ($DSection in $DebugSections) {
+            if ($DSection -match 'Device-ID|Chassis ID|System Name|Port-ID|Port ID') {
+                Write-Host "`n" -NoNewline
+                Write-Host "==================== [RAW DISCOVERY PACKET FRAME] ====================" -ForegroundColor Cyan
+                Write-Host $DSection.Trim() -ForegroundColor White
+                Write-Host "======================================================================" -ForegroundColor Cyan
+                Write-Host "`n" -NoNewline
+            }
+        }
+        # =========================================================================
+#>
+
+        # HARDENED REGEX: Targets the text past the absolute LAST colon on the keyword attribute lines
+        $DeviceRegex = [regex]::new('(?i)(?:Device-ID|System Name TLV)[^:\r\n]*:\s*(?:.*\s*bytes:\s*)?(.*)', 'IgnoreCase')
+        $PortRegex   = [regex]::new('(?i)(?:Port-ID|Port Description TLV)[^:\r\n]*:\s*(?:.*\s*bytes:\s*)?(.*)', 'IgnoreCase')
 
         $Sections = $Content -split '(?i)\[\d+\]\d{4}\.\d+::'
 
@@ -94,20 +123,30 @@ for ($Attempt = 1; $Attempt -le $MaxAttempts; $Attempt++) {
             $PortMatch   = $PortRegex.Match($Section)
 
             if ($DeviceMatch.Success -and $PortMatch.Success) {
-                # Extra aggressive trim
-                $Device = $DeviceMatch.Groups[1].Value.Trim(" '`",")
-                $Port   = $PortMatch.Groups[1].Value.Trim(" '`",")
+                
+                $Device = $DeviceMatch.Groups[1].Value
+                $Port   = $PortMatch.Groups[1].Value
 
-                # Remove any remaining trailing junk like "bytes:" or hex
-                $Device = $Device -replace '\s*value length.*$', '' -replace '\s*0x.*$', ''
-                $Port   = $Port -replace '\s*value length.*$', '' -replace '\s*0x.*$', ''
+                # Strip trailing line data artifacts
+                $Device = $Device -replace '\s*(?:value length|bytes|TLV|Subtype|\(|,).*$', '' -replace '\s*0x.*$', ''
+                $Port   = $Port -replace '\s*(?:value length|bytes|TLV|Subtype|\(|,).*$', '' -replace '\s*0x.*$', ''
+                
+                # Dynamic clean array to strip out wrapping spaces, quotes, and carriage returns
+                $TrimChars = @(' ', "'", '"', '`', '(', ')', "`r")
+                $Device = $Device.Trim($TrimChars)
+                $Port   = $Port.Trim($TrimChars)
+
+                # Skip if the text output parses down to generic metadata tags or empty lines
+                if ([string]::IsNullOrWhiteSpace($Device) -or [string]::IsNullOrWhiteSpace($Port) -or $Device -ieq "TLV" -or $Port -ieq "TLV" -or $Device -match '^\d+$') {
+                    continue
+                }
 
                 $Key = "$Device|$Port"
                 if (-not $Seen.ContainsKey($Key) -and $Device.Length -gt 1 -and $Port.Length -gt 1) {
                     $Seen[$Key] = $true
 
                     $NewResults += [PSCustomObject]@{
-                        Date               = Get-Date
+                        Date               = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
                         NeighborDeviceName = $Device
                         NeighborDevicePort = $Port
                         Protocol           = if ($Section -match '0x88cc|LLDP') { "LLDP" } else { "CDP" }
@@ -131,9 +170,18 @@ for ($Attempt = 1; $Attempt -le $MaxAttempts; $Attempt++) {
     }
 }
 
-# Merge + keep last 5
+# Merge arrays together
 $AllRecords = $NewResults + $CachedRecords
-$FinalRecords = $AllRecords | Select-Object -First 5
+
+# Force older deserialized date objects to fall flat into pure strings during formatting pipeline
+$FinalRecords = $AllRecords | ForEach-Object {
+    [PSCustomObject]@{
+        Date               = [string]($_.Date)
+        NeighborDeviceName = [string]($_.NeighborDeviceName)
+        NeighborDevicePort = [string]($_.NeighborDevicePort)
+        Protocol           = [string]($_.Protocol)
+    }
+} | Select-Object -First 5
 
 # Save cache
 $FinalRecords | ConvertTo-Json -Depth 3 | Set-Content $CacheFile -Force
@@ -144,7 +192,7 @@ pktmon filter remove *> $null 2>&1
 # Return Results
 if ($FinalRecords.Count -eq 0) {
     return [PSCustomObject]@{
-        Date               = Get-Date
+        Date               = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
         NeighborDeviceName = "No neighbor found"
         NeighborDevicePort = "No neighbor found"
         Protocol           = "N/A"
