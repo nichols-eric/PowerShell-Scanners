@@ -14,10 +14,11 @@ param (
 # Admin check
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     return [PSCustomObject]@{
-        Date               = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-        NeighborDeviceName = "ERROR: Administrator privileges required"
-        NeighborDevicePort = "ERROR: Administrator privileges required"
-        Protocol           = "N/A"
+        Date                   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ssZ")
+        NeighborDeviceName     = "ERROR: Administrator privileges required"
+        NeighborDevicePort     = "ERROR: Administrator privileges required"
+        NeighborDevicePortDesc = "ERROR: Administrator privileges required"
+        Protocol               = "N/A"
     }
 }
 
@@ -30,12 +31,13 @@ if ((Test-Path $CacheFile) -and -not $ClearCache) {
         # Flatten incoming cached objects to ensure dates are plain strings
         if ($CachedRecords) {
             $CachedRecords = @($CachedRecords) | ForEach-Object {
-                $CleanDate = if ($_.Date -like '@{value=*') { (Get-Date).ToString("yyyy-MM-dd HH:mm:ss") } else { [string]$_.Date }
+                $CleanDate = if ($_.Date -like '@{value=*') { (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ssZ") } else { [string]$_.Date }
                 [PSCustomObject]@{
-                    Date               = $CleanDate
-                    NeighborDeviceName = [string]$_.NeighborDeviceName
-                    NeighborDevicePort = [string]$_.NeighborDevicePort
-                    Protocol           = [string]$_.Protocol
+                    Date                   = $CleanDate
+                    NeighborDeviceName     = [string]$_.NeighborDeviceName
+                    NeighborDevicePort     = [string]$_.NeighborDevicePort
+                    NeighborDevicePortDesc = [string]$_.NeighborDevicePortDesc
+                    Protocol               = [string]$_.Protocol
                 }
             }
         }
@@ -53,10 +55,11 @@ $EthernetUp = Get-NetAdapter -Physical -ErrorAction SilentlyContinue |
 if (-not $EthernetUp) {
     if ($CachedRecords.Count -eq 0) {
         return [PSCustomObject]@{
-            Date               = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-            NeighborDeviceName = "No neighbor found"
-            NeighborDevicePort = "No neighbor found"
-            Protocol           = "N/A"
+            Date                   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ssZ")
+            NeighborDeviceName     = "No neighbor found"
+            NeighborDevicePort     = "No neighbor found"
+            NeighborDevicePortDesc = "No neighbor found"
+            Protocol               = "N/A"
         }
     } else {
         return $CachedRecords
@@ -112,29 +115,59 @@ for ($Attempt = 1; $Attempt -le $MaxAttempts; $Attempt++) {
         # =========================================================================
 #>
 
-        # HARDENED REGEX: Targets the text past the absolute LAST colon on the keyword attribute lines
-        $DeviceRegex = [regex]::new('(?i)(?:Device-ID|System Name TLV)[^:\r\n]*:\s*(?:.*\s*bytes:\s*)?(.*)', 'IgnoreCase')
-        $PortRegex   = [regex]::new('(?i)(?:Port-ID|Port Description TLV)[^:\r\n]*:\s*(?:.*\s*bytes:\s*)?(.*)', 'IgnoreCase')
-
         $Sections = $Content -split '(?i)\[\d+\]\d{4}\.\d+::'
 
         foreach ($Section in $Sections) {
-            $DeviceMatch = $DeviceRegex.Match($Section)
-            $PortMatch   = $PortRegex.Match($Section)
-
-            if ($DeviceMatch.Success -and $PortMatch.Success) {
+            if ($Section -match 'Device-ID|Chassis ID|System Name|Port-ID|Port ID') {
                 
-                $Device = $DeviceMatch.Groups[1].Value
-                $Port   = $PortMatch.Groups[1].Value
+                $Device   = ""
+                $Port     = ""
+                $PortDesc = ""
+
+                # Read line-by-line to avoid multi-line regex matching jumps
+                $Lines = $Section -split '\r?\n'
+                for ($i = 0; $i -lt $Lines.Count; $i++) {
+                    $Line = $Lines[$i]
+
+                    # 1. Capture Device Name
+                    if ($Line -match '(?i)(?:Device-ID|System Name TLV)') {
+                        if ($Line -match ':\s*(.*)$' -and $Matches[1] -and $Matches[1] -notmatch 'length') {
+                            $Device = $Matches[1]
+                        } elseif ($i + 1 -lt $Lines.Count -and $Lines[$i+1] -match ':\s*(.*)$') {
+                            $Device = $Matches[1]
+                        }
+                    }
+
+                    # 2. Capture Port ID
+                    if ($Line -match '(?i)(?:Port-ID|Port ID TLV)') {
+                        if ($Line -match ':\s*(.*)$' -and $Matches[1] -and $Matches[1] -notmatch 'length') {
+                            $Port = $Matches[1]
+                        } elseif ($i + 1 -lt $Lines.Count -and $Lines[$i+1] -match ':\s*(.*)$') {
+                            $Port = $Matches[1]
+                        }
+                    }
+
+                    # 3. Capture Port Description
+                    if ($Line -match '(?i)Port Description TLV') {
+                        if ($Line -match ':\s*(.*)$') {
+                            $PortDesc = $Matches[1]
+                        }
+                    }
+                }
+
+                # Fallback safely: if explicit Port ID isn't found, try Port Description
+                if ([string]::IsNullOrWhiteSpace($Port)) { $Port = $PortDesc }
 
                 # Strip trailing line data artifacts
-                $Device = $Device -replace '\s*(?:value length|bytes|TLV|Subtype|\(|,).*$', '' -replace '\s*0x.*$', ''
-                $Port   = $Port -replace '\s*(?:value length|bytes|TLV|Subtype|\(|,).*$', '' -replace '\s*0x.*$', ''
+                $Device   = $Device -replace '\s*(?:value length|bytes|TLV|Subtype|\(|,).*$', '' -replace '\s*0x.*$', ''
+                $Port     = $Port -replace '\s*(?:value length|bytes|TLV|Subtype|\(|,).*$', '' -replace '\s*0x.*$', ''
+                $PortDesc = $PortDesc -replace '\s*(?:value length|bytes|TLV|Subtype|\(|,).*$', '' -replace '\s*0x.*$', ''
                 
                 # Dynamic clean array to strip out wrapping spaces, quotes, and carriage returns
                 $TrimChars = @(' ', "'", '"', '`', '(', ')', "`r")
-                $Device = $Device.Trim($TrimChars)
-                $Port   = $Port.Trim($TrimChars)
+                $Device   = $Device.Trim($TrimChars)
+                $Port     = $Port.Trim($TrimChars)
+                $PortDesc = $PortDesc.Trim($TrimChars)
 
                 # Skip if the text output parses down to generic metadata tags or empty lines
                 if ([string]::IsNullOrWhiteSpace($Device) -or [string]::IsNullOrWhiteSpace($Port) -or $Device -ieq "TLV" -or $Port -ieq "TLV" -or $Device -match '^\d+$') {
@@ -146,10 +179,11 @@ for ($Attempt = 1; $Attempt -le $MaxAttempts; $Attempt++) {
                     $Seen[$Key] = $true
 
                     $NewResults += [PSCustomObject]@{
-                        Date               = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-                        NeighborDeviceName = $Device
-                        NeighborDevicePort = $Port
-                        Protocol           = if ($Section -match '0x88cc|LLDP') { "LLDP" } else { "CDP" }
+                        Date                   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ssZ")
+                        NeighborDeviceName     = $Device
+                        NeighborDevicePort     = $Port
+                        NeighborDevicePortDesc = $PortDesc
+                        Protocol               = if ($Section -match '0x88cc|LLDP') { "LLDP" } else { "CDP" }
                     }
                 }
             }
@@ -176,10 +210,11 @@ $AllRecords = $NewResults + $CachedRecords
 # Force older deserialized date objects to fall flat into pure strings during formatting pipeline
 $FinalRecords = $AllRecords | ForEach-Object {
     [PSCustomObject]@{
-        Date               = [string]($_.Date)
-        NeighborDeviceName = [string]($_.NeighborDeviceName)
-        NeighborDevicePort = [string]($_.NeighborDevicePort)
-        Protocol           = [string]($_.Protocol)
+        Date                   = [string]($_.Date)
+        NeighborDeviceName     = [string]($_.NeighborDeviceName)
+        NeighborDevicePort     = [string]($_.NeighborDevicePort)
+        NeighborDevicePortDesc = [string]($_.NeighborDevicePortDesc)
+        Protocol               = [string]($_.Protocol)
     }
 } | Select-Object -First 5
 
@@ -192,10 +227,11 @@ pktmon filter remove *> $null 2>&1
 # Return Results
 if ($FinalRecords.Count -eq 0) {
     return [PSCustomObject]@{
-        Date               = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-        NeighborDeviceName = "No neighbor found"
-        NeighborDevicePort = "No neighbor found"
-        Protocol           = "N/A"
+        Date                   = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ssZ")
+        NeighborDeviceName     = "No neighbor found"
+        NeighborDevicePort     = "No neighbor found"
+        NeighborDevicePortDesc = "No neighbor found"
+        Protocol               = "N/A"
     }
 } else {
     return $FinalRecords
